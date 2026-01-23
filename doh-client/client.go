@@ -90,6 +90,29 @@ func NewClient(conf *config.Config) (c *Client, err error) {
 		Net:     "tcp",
 		Timeout: time.Duration(conf.Other.Timeout) * time.Second,
 	}
+
+	if c.conf.Other.Interface != "" {
+		// Setup UDP Dialer
+		udpLocalAddr, err := c.bindToInterface("udp")
+		if err != nil {
+			return nil, fmt.Errorf("failed to bind passthrough UDP to interface %s: %v", c.conf.Other.Interface, err)
+		}
+		c.udpClient.Dialer = &net.Dialer{
+			Timeout:   time.Duration(conf.Other.Timeout) * time.Second,
+			LocalAddr: udpLocalAddr,
+		}
+
+		// Setup TCP Dialer
+		tcpLocalAddr, err := c.bindToInterface("tcp")
+		if err != nil {
+			return nil, fmt.Errorf("failed to bind passthrough TCP to interface %s: %v", c.conf.Other.Interface, err)
+		}
+		c.tcpClient.Dialer = &net.Dialer{
+			Timeout:   time.Duration(conf.Other.Timeout) * time.Second,
+			LocalAddr: tcpLocalAddr,
+		}
+	}
+
 	for _, addr := range conf.Listen {
 		c.udpServers = append(c.udpServers, &dns.Server{
 			Addr:    addr,
@@ -120,6 +143,14 @@ func NewClient(conf *config.Config) (c *Client, err error) {
 			PreferGo: true,
 			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 				var d net.Dialer
+				if c.conf.Other.Interface != "" {
+					localAddr, err := c.bindToInterface(network)
+					if err != nil {
+						log.Printf("Bootstrap dial warning: %v", err)
+					} else {
+						d.LocalAddr = localAddr
+					}
+				}
 				numServers := len(c.bootstrap)
 				bootstrap := c.bootstrap[rand.Intn(numServers)]
 				conn, err := d.DialContext(ctx, network, bootstrap)
@@ -240,6 +271,14 @@ func (c *Client) newHTTPClient() error {
 		KeepAlive: 30 * time.Second,
 		// DualStack: true,
 		Resolver: c.bootstrapResolver,
+	}
+	if c.conf.Other.Interface != "" {
+		localAddr, err := c.bindToInterface("tcp")
+		if err != nil {
+			log.Printf("Failed to resolve interface %s: %v", c.conf.Other.Interface, err)
+			return err
+		}
+		dialer.LocalAddr = localAddr
 	}
 	c.httpTransport = &http.Transport{
 		DialContext:           dialer.DialContext,
@@ -484,4 +523,51 @@ func (c *Client) findClientIP(w dns.ResponseWriter, r *dns.Msg) (ednsClientAddre
 		}
 	}
 	return
+}
+
+func (c *Client) bindToInterface(network string) (net.Addr, error) {
+	if c.conf.Other.Interface == "" {
+		return nil, nil
+	}
+	ifi, err := net.InterfaceByName(c.conf.Other.Interface)
+	if err != nil {
+		return nil, err
+	}
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return nil, err
+	}
+
+	// Determine if we need IPv4 or IPv6 based on the network string (e.g., "tcp4", "udp6")
+	wantIPv6 := strings.Contains(network, "6")
+	wantIPv4 := strings.Contains(network, "4") || !wantIPv6 // Default to 4 if not specified, or if generic "tcp"/"udp"
+
+	for _, addr := range addrs {
+		ip, _, err := net.ParseCIDR(addr.String())
+		if err != nil {
+			continue
+		}
+
+		// Skip if we want IPv4 but got IPv6
+		if ip.To4() == nil && wantIPv4 && !wantIPv6 {
+			continue
+		}
+		// Skip if we want IPv6 but got IPv4
+		if ip.To4() != nil && wantIPv6 {
+			continue
+		}
+		// Skip IPv6 if disabled in config
+		if ip.To4() == nil && c.conf.Other.NoIPv6 {
+			continue
+		}
+
+		// Return the appropriate address type
+		if strings.HasPrefix(network, "tcp") {
+			return &net.TCPAddr{IP: ip}, nil
+		}
+		if strings.HasPrefix(network, "udp") {
+			return &net.UDPAddr{IP: ip}, nil
+		}
+	}
+	return nil, fmt.Errorf("no suitable address found on interface %s for network %s", c.conf.Other.Interface, network)
 }
